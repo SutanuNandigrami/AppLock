@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="AppVault">
+<meta name="theme-color" content="#0a0a1a">
+<link rel="manifest" href="data:application/json;base64,eyJuYW1lIjoiQXBwVmF1bHQiLCJzaG9ydF9uYW1lIjoiQXBwVmF1bHQiLCJkaXNwbGF5Ijoic3RhbmRhbG9uZSIsImJhY2tncm91bmRfY29sb3IiOiIjMGEwYTFhIiwidGhlbWVfY29sb3IiOiIjMGEwYTFhIn0=">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230a0a1a'/%3E%3Ctext x='50' y='68' font-size='55' text-anchor='middle'%3E%F0%9F%9B%A1%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<title>AppVault</title>
+<style>
+  html, body { background: #0a0a1a; -webkit-user-select: none; user-select: none; overflow-x: hidden; }
+  input { -webkit-user-select: text; user-select: text; }
+</style>
+<base target="_blank">
+</head>
+<body>
+<div id="root">
+  <div style="display:flex;justify-content:center;align-items:center;height:100vh;background:#0a0a1a;color:rgba(255,255,255,0.5);font-family:-apple-system,BlinkMacSystemFont,sans-serif;">
+    Loading AppVault...
+  </div>
+</div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const STORAGE_KEY = "appvault-v5";
+const PBKDF2_ITER = 15000;
+const CALLBACK_URL = "shortcuts://callback";
+
+const LOCKOUT_TIERS = [
+  { failsAt: 10, duration: 5 * 60 * 1000, label: "5 minutes", short: "5 min" },
+  { failsAt: 20, duration: 30 * 60 * 1000, label: "30 minutes", short: "30 min" },
+  { failsAt: 30, duration: 6 * 3600 * 1000, label: "6 hours", short: "6 hr" },
+  { failsAt: 40, duration: 24 * 3600 * 1000, label: "24 hours", short: "24 hr" },
+];
+
+const toHex = (b) => Array.from(new Uint8Array(b)).map((x) => x.toString(16).padStart(2, "0")).join("");
+const fromHex = (h) => new Uint8Array((h.match(/.{1,2}/g) || []).map((x) => parseInt(x, 16)));
+const rnd = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+async function deriveKey(secret, saltHex) {
+  const mat = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", salt: fromHex(saltHex), iterations: PBKDF2_ITER, hash: "SHA-256" }, mat, { name: "AES-GCM", length: 256 }, false, ["wrapKey", "unwrapKey"]);
+}
+
+async function createMasterKey(secrets) {
+  const mk = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+  const raw = await crypto.subtle.exportKey("raw", mk);
+  const keys = [];
+  for (const [method, secret] of Object.entries(secrets)) {
+    const salt = toHex(rnd(16)), iv = rnd(12);
+    const dk = await deriveKey(secret, salt);
+    const w = await crypto.subtle.wrapKey("raw", mk, dk, { name: "AES-GCM", iv });
+    const entry = { method, salt, iv: toHex(iv), wrapped: toHex(new Uint8Array(w)) };
+    if (method === "pin") entry.pinLength = secret.length;
+    keys.push(entry);
+  }
+  return { masterKey: mk, wrappedKeys: keys, rawHex: toHex(new Uint8Array(raw)) };
+}
+
+async function tryUnwrap(secret, entry) {
+  try {
+    const dk = await deriveKey(secret, entry.salt);
+    return await crypto.subtle.unwrapKey("raw", fromHex(entry.wrapped), dk, { name: "AES-GCM", iv: fromHex(entry.iv) }, { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+  } catch { return null; }
+}
+
+async function encryptVault(data, key) {
+  const iv = rnd(12);
+  const enc = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(data)));
+  return { iv: toHex(iv), data: toHex(new Uint8Array(enc)) };
+}
+
+async function importRawKey(hex) {
+  return crypto.subtle.importKey("raw", fromHex(hex), { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+}
+
+async function saveData(d) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); return true; } catch { return false; } }
+async function loadData() { try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : null; } catch { return null; } }
+async function clearData() { try { localStorage.removeItem(STORAGE_KEY); } catch {} }
+
+async function enrollBio() {
+  if (typeof window !== "undefined" && window.PublicKeyCredential) {
+    try {
+      const c = await navigator.credentials.create({ publicKey: { challenge: rnd(32), rp: { name: "AppVault" }, user: { id: rnd(16), name: "u", displayName: "AppVault" }, pubKeyCredParams: [{ alg: -7, type: "public-key" }, { alg: -257, type: "public-key" }], authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required", residentKey: "required" }, timeout: 60000, attestation: "none" } });
+      if (c && c.rawId) return { kind: "webauthn", credentialId: toHex(c.rawId) };
+    } catch (e) { console.warn("WebAuthn:", e.message); }
+  }
+  return { kind: "demo" };
+}
+
+async function verifyBio(bio) {
+  if (!bio) return false;
+  if (bio.kind === "demo") { await new Promise((r) => setTimeout(r, 800)); return true; }
+  try {
+    const a = await navigator.credentials.get({ publicKey: { challenge: rnd(32), allowCredentials: [{ id: fromHex(bio.credentialId), type: "public-key", transports: ["internal"] }], userVerification: "required", timeout: 60000 } });
+    return !!a;
+  } catch { return false; }
+}
+
+function fmtTime(ms) {
+  if (ms <= 0) return "0s";
+  const t = Math.ceil(ms / 1000), h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}:${String(s).padStart(2, "0")}` : `${s}s`;
+}
+
+function getNextTier(c) {
+  const f = LOCKOUT_TIERS.find((t) => t.failsAt > c);
+  if (f) return f;
+  if (c >= 40) return { failsAt: Math.ceil((c + 1) / 10) * 10, duration: 24 * 3600 * 1000, label: "24 hours", short: "24 hr" };
+  return null;
+}
+
+function getTierHit(c) {
+  const e = LOCKOUT_TIERS.find((t) => t.failsAt === c);
+  if (e) return e;
+  if (c > 40 && c % 10 === 0) return LOCKOUT_TIERS[LOCKOUT_TIERS.length - 1];
+  return null;
+}
+
+const glassC = { background: "rgba(255,255,255,0.13)", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)", border: "0.5px solid rgba(255,255,255,0.22)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.28), 0 8px 20px rgba(0,0,0,0.22)" };
+const pillS = { padding: "13px 28px", borderRadius: 100, ...glassC, color: "#fff", fontSize: 16, fontWeight: 600, letterSpacing: -0.3, cursor: "pointer", fontFamily: "inherit", WebkitTapHighlightColor: "transparent", border: "0.5px solid rgba(255,255,255,0.25)" };
+const linkS = { background: "none", border: "none", color: "rgba(120,170,255,0.95)", fontSize: 15, fontWeight: 400, cursor: "pointer", fontFamily: "inherit", letterSpacing: -0.2, WebkitTapHighlightColor: "transparent", padding: "8px 14px" };
+const ML = { pin: "PIN", pattern: "Pattern", password: "Password" };
+const MD = { pin: "4\u201310 digit number", pattern: "Gesture on 3\u00d73 grid", password: "Letters, numbers, symbols" };
+
+function PatternLock({ onComplete, prompt, error }) {
+  const ref = useRef(null);
+  const [sel, setSel] = useState([]);
+  const [drag, setDrag] = useState(false);
+  const [cur, setCur] = useState(null);
+  const sz = Math.min(280, typeof window !== "undefined" ? window.innerWidth - 60 : 280);
+  const pad = 34, sp = (sz - 2 * pad) / 2, dr = 9, hr = sp * 0.38;
+  const dots = Array.from({ length: 9 }, (_, i) => ({ x: pad + (i % 3) * sp, y: pad + Math.floor(i / 3) * sp }));
+
+  useEffect(() => {
+    const c = ref.current; if (!c) return;
+    const x = c.getContext("2d"); if (!x) return;
+    const dpr = window.devicePixelRatio || 1;
+    c.width = sz * dpr; c.height = sz * dpr;
+    c.style.width = sz + "px"; c.style.height = sz + "px";
+    x.scale(dpr, dpr); x.clearRect(0, 0, sz, sz);
+    if (sel.length > 0) {
+      x.beginPath(); x.moveTo(dots[sel[0]].x, dots[sel[0]].y);
+      for (let i = 1; i < sel.length; i++) x.lineTo(dots[sel[i]].x, dots[sel[i]].y);
+      if (drag && cur) x.lineTo(cur.x, cur.y);
+      const g = x.createLinearGradient(0, 0, sz, sz);
+      if (error) { g.addColorStop(0, "rgba(255,69,58,0.95)"); g.addColorStop(1, "rgba(255,159,150,0.8)"); }
+      else { g.addColorStop(0, "rgba(255,255,255,0.95)"); g.addColorStop(1, "rgba(200,220,255,0.85)"); }
+      x.strokeStyle = g; x.lineWidth = 4; x.lineCap = "round"; x.lineJoin = "round";
+      x.shadowBlur = 20; x.shadowColor = error ? "rgba(255,69,58,0.4)" : "rgba(255,255,255,0.4)";
+      x.stroke(); x.shadowBlur = 0;
+    }
+    dots.forEach((dot, i) => {
+      const s = sel.includes(i);
+      x.beginPath(); x.arc(dot.x, dot.y, dr + 12, 0, Math.PI * 2);
+      x.fillStyle = s ? (error ? "rgba(255,100,100,0.2)" : "rgba(255,255,255,0.15)") : "rgba(255,255,255,0.04)"; x.fill();
+      x.strokeStyle = s ? (error ? "rgba(255,69,58,0.5)" : "rgba(255,255,255,0.4)") : "rgba(255,255,255,0.15)"; x.lineWidth = 1; x.stroke();
+      x.beginPath(); x.arc(dot.x, dot.y, s ? dr : dr * 0.55, 0, Math.PI * 2);
+      x.fillStyle = s ? (error ? "rgba(255,69,58,0.9)" : "rgba(255,255,255,0.9)") : "rgba(255,255,255,0.35)"; x.fill();
+    });
+  }, [sel, drag, cur, error, sz]);
+
+  const gp = (e) => { if (!ref.current) return { x: 0, y: 0 }; const r = ref.current.getBoundingClientRect(); const t = "touches" in e ? e.touches[0] : e; return { x: t.clientX - r.left, y: t.clientY - r.top }; };
+  const fd = (p) => { for (let i = 0; i < dots.length; i++) if (Math.hypot(p.x - dots[i].x, p.y - dots[i].y) < hr) return i; return -1; };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 20 }}>
+      <p style={{ color: error ? "#ff6961" : "rgba(255,255,255,0.75)", fontSize: 15, fontWeight: 500, minHeight: 22, textAlign: "center", transition: "color 0.14s" }}>{error || prompt}</p>
+      <canvas ref={ref} style={{ touchAction: "none", width: sz, height: sz }}
+        onTouchStart={(e) => { e.preventDefault(); setDrag(true); const p = gp(e); setCur(p); const d2 = fd(p); if (d2 >= 0) setSel([d2]); }}
+        onTouchMove={(e) => { e.preventDefault(); if (!drag) return; const p = gp(e); setCur(p); const d2 = fd(p); if (d2 >= 0 && !sel.includes(d2)) { setSel((v) => [...v, d2]); if (navigator.vibrate) navigator.vibrate(8); } }}
+        onTouchEnd={(e) => { e.preventDefault(); setDrag(false); setCur(null); if (sel.length >= 4) onComplete(sel.join(",")); setTimeout(() => setSel([]), error ? 350 : 200); }}
+        onMouseDown={(e) => { setDrag(true); const p = gp(e); setCur(p); const d2 = fd(p); if (d2 >= 0) setSel([d2]); }}
+        onMouseMove={(e) => { if (!drag) return; const p = gp(e); setCur(p); const d2 = fd(p); if (d2 >= 0 && !sel.includes(d2)) setSel((v) => [...v, d2]); }}
+        onMouseUp={() => { setDrag(false); setCur(null); if (sel.length >= 4) onComplete(sel.join(",")); setTimeout(() => setSel([]), 200); }}
+      />
+    </div>
+  );
+}
+
+function PINPad({ onComplete, prompt, error, targetLength }) {
+  const [pin, setPin] = useState("");
+  const [shake, setShake] = useState(false);
+  const maxLen = targetLength || 10, minLen = targetLength || 4, showConfirm = !targetLength;
+  useEffect(() => { if (error) { setShake(true); setTimeout(() => { setShake(false); setPin(""); }, 280); } }, [error]);
+  const add = (d) => { if (pin.length >= maxLen) return; if (navigator.vibrate) navigator.vibrate(5); const n = pin + d; setPin(n); if (targetLength && n.length === targetLength) setTimeout(() => { onComplete(n); setTimeout(() => setPin(""), 180); }, 80); };
+  const confirm = () => { if (pin.length >= minLen) { onComplete(pin); setTimeout(() => setPin(""), 180); } };
+  const L = { "2": "ABC", "3": "DEF", "4": "GHI", "5": "JKL", "6": "MNO", "7": "PQRS", "8": "TUV", "9": "WXYZ" };
+  const dotsCount = targetLength || Math.max(pin.length, 4);
+  const canSubmit = pin.length >= minLen;
+  const btn = (n) => (<button key={n} className="pin-btn" onClick={() => add(String(n))}><span className="pin-num">{n}</span>{L[String(n)] && <span className="pin-letters">{L[String(n)]}</span>}</button>);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 24 }}>
+      <p style={{ color: error ? "#ff6961" : "rgba(255,255,255,0.75)", fontSize: 15, fontWeight: 500, minHeight: 22, transition: "color 0.14s" }}>{error || prompt}</p>
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", justifyContent: "center", animation: shake ? "iosShake 0.28s cubic-bezier(0.36,0.07,0.19,0.97)" : "none" }}>
+        {Array.from({ length: dotsCount }).map((_, i) => { const f = i < pin.length; return <div key={i} style={{ width: 12, height: 12, borderRadius: "50%", background: f ? (error ? "#ff6961" : "#fff") : "rgba(255,255,255,0.15)", border: `1.5px solid ${f ? (error ? "#ff6961" : "rgba(255,255,255,0.9)") : "rgba(255,255,255,0.35)"}`, boxShadow: f ? (error ? "0 0 14px rgba(255,105,97,0.7)" : "0 0 14px rgba(255,255,255,0.55)") : "none", transition: "transform 0.22s cubic-bezier(0.2,0.9,0.3,1.28), background 0.1s", transform: `scale(${f ? 1.22 : 1}) translateZ(0)` }} />; })}
+      </div>
+      {!targetLength && <p style={{ color: "rgba(255,255,255,0.4)", fontSize: 12 }}>{pin.length} digits (4\u201310)</p>}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 74px)", gap: 18 }}>
+        {[1, 2, 3, 4, 5, 6, 7, 8, 9].map(btn)}
+        {showConfirm ? <button className="pin-btn" onClick={confirm} style={{ opacity: canSubmit ? 1 : 0.35, background: canSubmit ? "linear-gradient(145deg, rgba(52,199,89,0.5), rgba(52,199,89,0.2))" : "linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04))" }}><span style={{ fontSize: 28 }}>{"\u2713"}</span></button> : <div />}
+        {btn(0)}
+        <button onClick={() => { if (navigator.vibrate) navigator.vibrate(5); setPin((p) => p.slice(0, -1)); }} className="pin-back" style={{ width: 74, height: 74, background: "transparent", border: "none", color: "rgba(255,255,255,0.85)", fontSize: 22, cursor: "pointer", WebkitTapHighlightColor: "transparent", fontFamily: "inherit" }}>{"\u232B"}</button>
+      </div>
+    </div>
+  );
+}
+
+function PasswordInput({ onComplete, prompt, error }) {
+  const [pw, setPw] = useState("");
+  const [show, setShow] = useState(false);
+  const [shake, setShake] = useState(false);
+  useEffect(() => { if (error) { setShake(true); setTimeout(() => { setShake(false); setPw(""); }, 280); } }, [error]);
+  const submit = () => { if (pw.length >= 6) onComplete(pw); };
+  const canSubmit = pw.length >= 6;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 20, width: "100%", maxWidth: 320 }}>
+      <p style={{ color: error ? "#ff6961" : "rgba(255,255,255,0.75)", fontSize: 15, fontWeight: 500, minHeight: 22, transition: "color 0.14s" }}>{error || prompt}</p>
+      <div style={{ display: "flex", gap: 8, width: "100%", animation: shake ? "iosShake 0.28s cubic-bezier(0.36,0.07,0.19,0.97)" : "none" }}>
+        <input type={show ? "text" : "password"} value={pw} onChange={(e) => setPw(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") submit(); }} placeholder="Min 6 characters" autoComplete="off" style={{ flex: 1, padding: "14px 16px", borderRadius: 14, background: "rgba(255,255,255,0.1)", border: "0.5px solid rgba(255,255,255,0.22)", color: "#fff", fontSize: 16, fontFamily: "inherit", outline: "none", letterSpacing: show ? -0.2 : 4 }} />
+        <button onClick={() => setShow((v) => !v)} style={{ width: 48, borderRadius: 14, background: "rgba(255,255,255,0.08)", border: "0.5px solid rgba(255,255,255,0.18)", color: "rgba(255,255,255,0.7)", fontSize: 18, cursor: "pointer", fontFamily: "inherit" }}>{show ? "\u25C9" : "\u25CE"}</button>
+      </div>
+      <p style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, alignSelf: "flex-start" }}>{pw.length} chars{pw.length < 6 ? ` (need ${6 - pw.length} more)` : ""}</p>
+      <button className="pill-btn" onClick={submit} style={{ ...pillS, width: "100%", opacity: canSubmit ? 1 : 0.35, background: canSubmit ? "rgba(120,170,255,0.3)" : "rgba(255,255,255,0.08)", border: "0.5px solid " + (canSubmit ? "rgba(180,210,255,0.4)" : "rgba(255,255,255,0.15)") }}>{prompt.indexOf("Create") >= 0 ? "Set Password" : "Unlock"}</button>
+    </div>
+  );
+}
+
+function AppVault() {
+  const [screen, setScreen] = useState("loading");
+  const [config, setConfig] = useState(null);
+  const [error, setError] = useState(null);
+  const [info, setInfo] = useState(null);
+  const [now, setNow] = useState(Date.now());
+  const [selMethods, setSelMethods] = useState(["pin"]);
+  const [setupStep, setSetupStep] = useState(0);
+  const [secrets, setSecrets] = useState({});
+  const [firstSecret, setFirstSecret] = useState(null);
+  const [hintInput, setHintInput] = useState("");
+  const [bio, setBio] = useState(null);
+  const [bioBusy, setBioBusy] = useState(false);
+  const [activeMethod, setActiveMethod] = useState("pin");
+  const [revealHint, setRevealHint] = useState(false);
+
+  useEffect(() => { const i = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(i); }, []);
+
+  useEffect(() => {
+    (async () => {
+      const d = await loadData();
+      if (d && d.keys && d.keys.length > 0) { setConfig(d); setActiveMethod(d.keys[0].method); setScreen("locked"); }
+      else setScreen("setup-methods");
+    })();
+  }, []);
+
+  useEffect(() => {
+    let wasHidden = false;
+    const onVis = () => { if (document.visibilityState === "hidden") wasHidden = true; else if (wasHidden && config) { wasHidden = false; setScreen("locked"); setError(null); setRevealHint(false); } };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [config]);
+
+  const fc = config ? config.failedCount || 0 : 0;
+  const lockUntil = config && config.lockoutUntil && config.lockoutUntil > now ? config.lockoutUntil : null;
+  const remaining = lockUntil ? lockUntil - now : 0;
+  const nextT = getNextTier(fc);
+  const attLeft = nextT && config ? nextT.failsAt - fc : null;
+  const hintAvail = !!(config && config.hint) && fc >= 10;
+  const bioEnrolled = !!(config && config.biometric);
+  const bioAvail = bioEnrolled && fc >= 20;
+
+  const flash = (m) => { setError(m); setTimeout(() => setError(null), 1800); };
+  const flashI = (m) => { setInfo(m); setTimeout(() => setInfo(null), 2400); };
+  const curMethod = selMethods[setupStep];
+
+  const handleSetupFirst = (s) => { setFirstSecret(s); setScreen("setup-confirm"); setError(null); };
+  const handleSetupConfirm = (s) => {
+    if (s === firstSecret) {
+      const next = { ...secrets, [curMethod]: s }; setSecrets(next); setFirstSecret(null);
+      if (setupStep + 1 < selMethods.length) { setSetupStep(setupStep + 1); setScreen("setup-secret"); }
+      else setScreen("setup-extras");
+      setError(null);
+    } else flash("Doesn't match. Try again");
+  };
+
+  const handleFinishSetup = async () => {
+    try {
+      const { masterKey, wrappedKeys, rawHex } = await createMasterKey(secrets);
+      const vault = await encryptVault({ created: Date.now() }, masterKey);
+      const cfg = { version: 5, vault, keys: wrappedKeys, failedCount: 0, lockoutUntil: null, biometric: bio || null, bioMasterKey: bio ? rawHex : null, hint: hintInput.trim() || null };
+      setConfig(cfg); setScreen("unlocked"); saveData(cfg);
+    } catch (e) { flash("Error: " + e.message); }
+  };
+
+  const handleEnrollBio = async () => {
+    setBioBusy(true); const b = await enrollBio(); setBioBusy(false);
+    if (b) { setBio(b); flashI(b.kind === "demo" ? "Face ID (demo)" : "Face ID enabled"); }
+    else flash("Failed");
+  };
+
+  const handleUnlock = async (s) => {
+    if (lockUntil || !config) return;
+    const entry = config.keys.find((k) => k.method === activeMethod);
+    if (!entry) { flash("Not configured"); return; }
+    const mk = await tryUnwrap(s, entry);
+    if (mk) {
+      const nc = { ...config, failedCount: 0, lockoutUntil: null };
+      setConfig(nc); setRevealHint(false); setScreen("unlocked"); saveData(nc);
+    } else {
+      const nc2 = fc + 1; const tier = getTierHit(nc2);
+      const nc = { ...config, failedCount: nc2, lockoutUntil: tier ? Date.now() + tier.duration : config.lockoutUntil || null };
+      if (tier) flash("Locked for " + tier.label); else flash("Wrong " + ML[activeMethod]);
+      setConfig(nc); saveData(nc);
+    }
+  };
+
+  const handleBioUnlock = async () => {
+    if (!config || !config.biometric || !config.bioMasterKey) return;
+    setBioBusy(true); const ok = await verifyBio(config.biometric); setBioBusy(false);
+    if (ok) {
+      try { await importRawKey(config.bioMasterKey); const nc = { ...config, failedCount: 0, lockoutUntil: null }; setConfig(nc); setRevealHint(false); setScreen("unlocked"); saveData(nc); }
+      catch { flash("Decrypt failed"); }
+    } else flash("Face ID failed");
+  };
+
+  const handleReset = () => {
+    setConfig(null); setSecrets({}); setFirstSecret(null); setHintInput(""); setBio(null);
+    setError(null); setRevealHint(false); setSetupStep(0); setSelMethods(["pin"]);
+    setScreen("setup-methods"); clearData();
+  };
+
+  const renderInput = (m, onDone, pr, pinLen) => {
+    if (m === "pin") return <PINPad key={"p-" + screen} onComplete={onDone} prompt={pr} error={error} targetLength={pinLen} />;
+    if (m === "pattern") return <PatternLock key={"pt-" + screen} onComplete={onDone} prompt={pr} error={error} />;
+    return <PasswordInput key={"pw-" + screen} onComplete={onDone} prompt={pr} error={error} />;
+  };
+
+  const curEntry = config && config.keys ? config.keys.find((k) => k.method === activeMethod) : undefined;
+  const methods = ["pin", "pattern", "password"];
+
+  return (
+    <>
+      <style>{`
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-font-smoothing: antialiased; }
+        html, body { background: #0a0a1a; -webkit-user-select: none; user-select: none; overflow-x: hidden; }
+        input { -webkit-user-select: text; user-select: text; }
+        @keyframes iosShake { 0%{transform:translateX(0)} 15%{transform:translateX(-7px)} 30%{transform:translateX(6px)} 45%{transform:translateX(-5px)} 60%{transform:translateX(4px)} 75%{transform:translateX(-2px)} 100%{transform:translateX(0)} }
+        @keyframes fadeIn { from{opacity:0;transform:scale(0.98)} to{opacity:1;transform:scale(1)} }
+        @keyframes checkPop { 0%{transform:scale(0.3);opacity:0} 60%{transform:scale(1.15);opacity:1} 100%{transform:scale(1);opacity:1} }
+        @keyframes pulse { 0%,100%{opacity:0.5} 50%{opacity:1} }
+        .pin-btn { width:74px; height:74px; border-radius:50%; background:linear-gradient(145deg,rgba(255,255,255,0.22),rgba(255,255,255,0.08)); border:0.5px solid rgba(255,255,255,0.24); box-shadow:inset 0 1px 0 rgba(255,255,255,0.32),inset 0 -1px 2px rgba(0,0,0,0.1),0 4px 12px rgba(0,0,0,0.22); color:#fff; cursor:pointer; display:flex; flex-direction:column; align-items:center; justify-content:center; -webkit-tap-highlight-color:transparent; transition:transform 0.22s cubic-bezier(0.18,0.9,0.3,1.2),background 0.1s; transform:scale(1) translateZ(0); padding:0; font-family:inherit; }
+        .pin-btn:active { transform:scale(0.9) translateZ(0); transition:transform 0.04s linear; background:linear-gradient(145deg,rgba(255,255,255,0.5),rgba(255,255,255,0.2)); }
+        .pin-num { font-size:32px; font-weight:300; line-height:1; }
+        .pin-letters { font-size:9.5px; font-weight:600; letter-spacing:2px; margin-top:3px; opacity:0.85; }
+        .pin-back:active { opacity:0.55; }
+        .pill-btn { transition:transform 0.22s cubic-bezier(0.18,0.9,0.3,1.2); transform:scale(1) translateZ(0); }
+        .pill-btn:active { transform:scale(0.96) translateZ(0); transition:transform 0.04s linear; filter:brightness(1.15); }
+        .tile-btn { transition:transform 0.22s cubic-bezier(0.18,0.9,0.3,1.2); transform:scale(1) translateZ(0); }
+        .tile-btn:active { transform:scale(0.975) translateZ(0); transition:transform 0.04s linear; }
+        .tab-btn { padding:8px 16px; border-radius:100px; border:0.5px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.6); font-size:13px; font-weight:600; cursor:pointer; font-family:inherit; -webkit-tap-highlight-color:transparent; transition:all 0.18s; }
+        .tab-btn:active { transform:scale(0.95); }
+        .tab-active { background:rgba(255,255,255,0.18); color:#fff; border-color:rgba(255,255,255,0.3); }
+      `}</style>
+
+      <div style={{ minHeight: "100vh", backgroundColor: "#0a0a1a", backgroundImage: "radial-gradient(ellipse 50% 40% at 25% 18%,rgba(255,90,180,0.42),transparent 70%),radial-gradient(ellipse 55% 45% at 82% 55%,rgba(90,140,255,0.48),transparent 70%),radial-gradient(ellipse 50% 45% at 35% 88%,rgba(180,100,255,0.4),transparent 70%),radial-gradient(ellipse 45% 35% at 78% 22%,rgba(255,200,100,0.25),transparent 70%)", display: "flex", flexDirection: "column", alignItems: "center", padding: "40px 20px 30px", fontFamily: "-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',sans-serif" }}>
+        <div style={{ width: "100%", display: "flex", flexDirection: "column", alignItems: "center", animation: "fadeIn 0.4s" }}>
+
+          {screen === "loading" && <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 15 }}>Loading...</p>}
+
+          {screen === "setup-methods" && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 20, width: "100%", maxWidth: 340 }}>
+              <div style={{ textAlign: "center", marginBottom: 12 }}>
+                <div style={{ width: 72, height: 72, margin: "0 auto 18px", borderRadius: 20, background: "linear-gradient(145deg,rgba(255,255,255,0.25),rgba(255,255,255,0.05))", border: "0.5px solid rgba(255,255,255,0.3)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.35),0 12px 40px rgba(0,0,0,0.3)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36 }}>{"🛡️"}</div>
+                <h1 style={{ color: "#fff", fontSize: 34, fontWeight: 700, letterSpacing: -0.8 }}>AppVault</h1>
+                <p style={{ color: "rgba(255,255,255,0.65)", fontSize: 15, marginTop: 8 }}>Choose unlock methods</p>
+              </div>
+              {methods.map((m) => { const on = selMethods.includes(m); return (
+                <button key={m} className="tile-btn" onClick={() => setSelMethods((v) => on ? v.filter((x) => x !== m) : [...v, m])} style={{ display: "flex", alignItems: "center", gap: 14, padding: "14px 16px", borderRadius: 18, ...glassC, color: "#fff", cursor: "pointer", textAlign: "left", width: "100%", fontFamily: "inherit", borderColor: on ? "rgba(120,170,255,0.5)" : "rgba(255,255,255,0.22)" }}>
+                  <div style={{ width: 26, height: 26, borderRadius: 8, border: "2px solid " + (on ? "rgba(120,170,255,0.9)" : "rgba(255,255,255,0.3)"), background: on ? "rgba(120,170,255,0.3)" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: "#fff", fontWeight: 700 }}>{on ? "\u2713" : ""}</div>
+                  <div style={{ flex: 1 }}><div style={{ fontSize: 16, fontWeight: 600 }}>{ML[m]}</div><div style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", marginTop: 2 }}>{MD[m]}</div></div>
+                </button>); })}
+              <button className="pill-btn" onClick={() => { if (!selMethods.length) return; setSetupStep(0); setSecrets({}); setFirstSecret(null); setScreen("setup-secret"); }} style={{ ...pillS, width: "100%", marginTop: 8, opacity: selMethods.length ? 1 : 0.35, background: selMethods.length ? "rgba(120,170,255,0.3)" : "rgba(255,255,255,0.08)" }}>Continue</button>
+            </div>
+          )}
+
+          {screen === "setup-secret" && curMethod && (<>
+            {renderInput(curMethod, handleSetupFirst, curMethod === "pin" ? "Create your PIN" : curMethod === "pattern" ? "Draw your pattern" : "Create your password")}
+            <p style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, marginTop: 12 }}>{setupStep + 1} of {selMethods.length}: {ML[curMethod]}</p>
+            <button onClick={() => { if (setupStep > 0) { setSetupStep(setupStep - 1); setScreen("setup-secret"); } else setScreen("setup-methods"); setFirstSecret(null); setError(null); }} style={linkS}>Back</button>
+          </>)}
+
+          {screen === "setup-confirm" && curMethod && (<>
+            {renderInput(curMethod, handleSetupConfirm, curMethod === "pin" ? "Re-enter PIN" : curMethod === "pattern" ? "Draw again" : "Re-enter password", curMethod === "pin" && firstSecret ? firstSecret.length : undefined)}
+            <button onClick={() => { setScreen("setup-secret"); setFirstSecret(null); setError(null); }} style={linkS}>Start Over</button>
+          </>)}
+
+          {screen === "setup-extras" && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 18, width: "100%", maxWidth: 340 }}>
+              <div style={{ textAlign: "center", marginBottom: 4 }}><h2 style={{ color: "#fff", fontSize: 26, fontWeight: 700 }}>Extra Security</h2><p style={{ color: "rgba(255,255,255,0.6)", fontSize: 14, marginTop: 8 }}>Both optional</p></div>
+              <div style={{ width: "100%", padding: "14px 16px", borderRadius: 16, ...glassC }}>
+                <label style={{ display: "block", color: "rgba(255,255,255,0.55)", fontSize: 12, fontWeight: 600, letterSpacing: 0.4, marginBottom: 6, textTransform: "uppercase" }}>Hint</label>
+                <input type="text" value={hintInput} onChange={(e) => setHintInput(e.target.value)} placeholder="e.g. birthday year reversed" maxLength={60} style={{ width: "100%", background: "transparent", border: "none", outline: "none", color: "#fff", fontSize: 15, fontFamily: "inherit", padding: 0 }} />
+                <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, marginTop: 6 }}>Shows after 10 fails</div>
+              </div>
+              <button onClick={handleEnrollBio} disabled={bioBusy} style={{ display: "flex", alignItems: "center", width: "100%", padding: "14px 16px", borderRadius: 16, ...glassC, color: "#fff", cursor: bioBusy ? "wait" : "pointer", fontFamily: "inherit", opacity: bioBusy ? 0.6 : 1 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <span style={{ fontSize: 24 }}>{bio ? "\u2713" : "\u2334"}</span>
+                  <div style={{ textAlign: "left" }}><div style={{ fontSize: 15, fontWeight: 600 }}>{bio ? (bio.kind === "demo" ? "Face ID (demo)" : "Face ID enabled") : "Set up Face ID"}</div><div style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", marginTop: 2 }}>Recovery after 20 fails</div></div>
+                </div>
+              </button>
+              <button className="pill-btn" onClick={handleFinishSetup} style={{ ...pillS, width: "100%", marginTop: 8, background: "rgba(120,170,255,0.3)", border: "0.5px solid rgba(180,210,255,0.4)" }}>Done</button>
+              {info && <div style={{ color: "rgba(180,210,255,0.9)", fontSize: 13, marginTop: 4 }}>{info}</div>}
+              {error && <div style={{ color: "#ff6961", fontSize: 13, marginTop: 4 }}>{error}</div>}
+            </div>
+          )}
+
+          {screen === "locked" && !lockUntil && config && (<>
+            <div style={{ textAlign: "center", marginBottom: 16 }}>
+              <div style={{ width: 52, height: 52, margin: "0 auto 12px", borderRadius: 14, background: "linear-gradient(145deg,rgba(255,255,255,0.2),rgba(255,255,255,0.05))", border: "0.5px solid rgba(255,255,255,0.3)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.35),0 8px 24px rgba(0,0,0,0.25)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 }}>{"🔒"}</div>
+              <h2 style={{ color: "#fff", fontSize: 20, fontWeight: 600 }}>AppVault</h2>
+            </div>
+            {config.keys.length > 1 && <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>{config.keys.map((k) => <button key={k.method} className={"tab-btn " + (activeMethod === k.method ? "tab-active" : "")} onClick={() => setActiveMethod(k.method)}>{ML[k.method]}</button>)}</div>}
+            {renderInput(activeMethod, handleUnlock, activeMethod === "pin" ? "Enter PIN" : activeMethod === "pattern" ? "Draw pattern" : "Enter password", curEntry && curEntry.pinLength)}
+            {revealHint && config.hint && <div style={{ ...glassC, padding: "10px 16px", borderRadius: 12, marginTop: 14, maxWidth: 300, textAlign: "center" }}><div style={{ color: "rgba(255,255,255,0.5)", fontSize: 10, fontWeight: 600, textTransform: "uppercase", marginBottom: 4 }}>Hint</div><div style={{ color: "#fff", fontSize: 14 }}>{config.hint}</div></div>}
+            {attLeft !== null && attLeft <= 3 && attLeft > 0 && nextT && <div style={{ color: "rgba(255,159,0,0.9)", fontSize: 12, fontWeight: 500, marginTop: 14 }}>{attLeft} attempt{attLeft === 1 ? "" : "s"} before {nextT.short} lockout</div>}
+            <div style={{ display: "flex", gap: 4, marginTop: 16, flexWrap: "wrap", justifyContent: "center" }}>
+              {hintAvail && <button onClick={() => setRevealHint((v) => !v)} style={linkS}>{revealHint ? "Hide hint" : "Forgot?"}</button>}
+              {bioAvail && <button onClick={handleBioUnlock} disabled={bioBusy} style={{ ...linkS, opacity: bioBusy ? 0.5 : 1 }}>{bioBusy ? "Verifying..." : "Use Face ID"}</button>}
+            </div>
+          </>)}
+
+          {screen === "locked" && lockUntil && config && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 18, maxWidth: 340, textAlign: "center", marginTop: 20 }}>
+              <div style={{ width: 80, height: 80, borderRadius: 24, background: "linear-gradient(145deg,rgba(255,90,80,0.4),rgba(255,90,80,0.1))", border: "0.5px solid rgba(255,105,97,0.5)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.3),0 12px 40px rgba(255,90,80,0.25)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 40 }}>{"\u23F1"}</div>
+              <div><h2 style={{ color: "#fff", fontSize: 24, fontWeight: 700 }}>Too many attempts</h2><p style={{ color: "rgba(255,255,255,0.6)", fontSize: 14, marginTop: 8 }}>{fc} failed. Try again in</p></div>
+              <div style={{ color: "#fff", fontSize: 44, fontWeight: 300, fontVariantNumeric: "tabular-nums", padding: "14px 26px", borderRadius: 20, ...glassC, minWidth: 180 }}>{fmtTime(remaining)}</div>
+              {bioAvail && <button className="pill-btn" onClick={handleBioUnlock} disabled={bioBusy} style={{ ...pillS, background: "rgba(120,170,255,0.25)", marginTop: 8, opacity: bioBusy ? 0.6 : 1 }}>{"\u2394"} {bioBusy ? "Verifying..." : "Recover with Face ID"}</button>}
+              {!bioEnrolled && <p style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, marginTop: 4 }}>Face ID not set up.</p>}
+              {bioEnrolled && !bioAvail && <p style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, marginTop: 4 }}>Face ID after {20 - fc > 0 ? 20 - fc : 0} more fails.</p>}
+              {fc >= 30 && <button className="pill-btn" onClick={handleReset} style={{ ...linkS, color: "rgba(255,105,97,0.8)", fontSize: 13, marginTop: 8 }}>Reset Everything</button>}
+            </div>
+          )}
+
+          {screen === "unlocked" && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 24, marginTop: 40 }}>
+              <div style={{ width: 100, height: 100, borderRadius: 30, background: "linear-gradient(145deg,rgba(52,199,89,0.5),rgba(52,199,89,0.15))", border: "0.5px solid rgba(255,255,255,0.3)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.4),0 20px 60px rgba(52,199,89,0.3)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 52, animation: "checkPop 0.5s cubic-bezier(0.34,1.56,0.64,1)" }}>{"\u2713"}</div>
+              <div style={{ textAlign: "center" }}><h2 style={{ color: "#fff", fontSize: 28, fontWeight: 700 }}>Unlocked</h2><p style={{ color: "rgba(255,255,255,0.6)", fontSize: 15, marginTop: 8 }}>Tap Proceed to return</p></div>
+              
+              <button 
+                className="pill-btn" 
+                onClick={() => {
+                  window.location.href = CALLBACK_URL;
+                  setTimeout(() => {
+                    if (navigator.clipboard) navigator.clipboard.writeText("success");
+                  }, 300);
+                }}
+                style={{ ...pillS, background: "rgba(52,199,89,0.35)", border: "0.5px solid rgba(52,199,89,0.5)", width: "100%", maxWidth: 280 }}
+              >
+                Proceed
+              </button>
+              
+              <button className="pill-btn" onClick={() => { setScreen("locked"); setError(null); setRevealHint(false); }} style={pillS}>Lock Again</button>
+              <button className="pill-btn" onClick={handleReset} style={{ ...linkS, color: "rgba(255,105,97,0.85)", fontSize: 14 }}>Reset Everything</button>
+            </div>
+          )}
+
+        </div>
+      </div>
+    </>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<AppVault />);
+</script>
+</body>
+</html>
